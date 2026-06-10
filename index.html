@@ -4114,7 +4114,10 @@
         </div>
         <div class="assignments-header">
           <div style="font-size:14px;color:var(--ink-soft);" id="assignmentSummary">Loading assignments...</div>
-          <button class="btn-primary" id="newAssignmentBtn">+ New Assignment</button>
+          <div style="display:flex;gap:10px;align-items:center;">
+            <button class="btn-ghost" id="clearAllNotifsBtn" style="font-size:12px;padding:8px 14px;color:var(--ink-soft);">Clear all unread badges</button>
+            <button class="btn-primary" id="newAssignmentBtn">+ New Assignment</button>
+          </div>
         </div>
         <div class="assignment-list" id="assignmentList"></div>
       </div>
@@ -8918,6 +8921,38 @@ async function loadAssignments() {
   renderAssignments();
 }
 
+
+async function clearAllUnreadNotifications() {
+  if (!firebaseReady || !db) {
+    alert('Firebase not connected.');
+    return;
+  }
+  if (!confirm('Mark ALL unread notifications as read? This clears the badge count for every pending review.')) return;
+  try {
+    const snap = await db.ref('notifications').once('value');
+    const data = snap.val() || {};
+    const updates = {};
+    Object.entries(data).forEach(([id, n]) => {
+      if (!n.read) updates['notifications/' + id + '/read'] = true;
+    });
+    if (Object.keys(updates).length > 0) {
+      await db.ref().update(updates);
+    }
+    pendingNotifications = 0;
+    updateAssignmentsBadge();
+    showToast(`Cleared ${Object.keys(updates).length} notification${Object.keys(updates).length === 1 ? '' : 's'}`);
+  } catch (e) {
+    console.error('Clear all failed', e);
+    alert('Could not clear: ' + (e && e.message ? e.message : 'unknown'));
+  }
+}
+
+// Wire the clear-all button when the DOM is ready
+document.addEventListener('DOMContentLoaded', () => {
+  const clearBtn = document.getElementById('clearAllNotifsBtn');
+  if (clearBtn) clearBtn.addEventListener('click', clearAllUnreadNotifications);
+});
+
 function updateAssignmentsBadge() {
   const badge = document.getElementById('assignmentsBadge');
   if (!badge) return;
@@ -8954,15 +8989,19 @@ function renderAssignments() {
     const completedDt = a.completedAt ? new Date(a.completedAt).toLocaleDateString() : null;
     const testCount = (a.tests || []).length;
     const tests = (a.tests || []).map(t => `<span class="assignment-test-pill">${(ROLE_LABELS[t] || t).replace('Loan Officer', 'LO').replace('Branch Manager', 'BM').replace('Regional Manager', 'RM').replace('Loan Officer Assistant', 'LOA').replace('Executive Team', 'Exec').replace('Sales Candidate', 'Drive')}</span>`).join('') + (testCount > 1 ? `<span style="font-size:11px;color:var(--ink-soft);margin-left:6px;">${testCount} tests</span>` : '');
-    return `<div class="assignment-row ${status}" data-token="${a.token}">
+    const tok = a._fbKey || a.token;
+    const primaryActionBtn = status === 'completed'
+      ? `<button class="assignment-action-btn primary" data-action="review" data-token="${tok}">Review</button>`
+      : `<button class="assignment-action-btn" data-action="resend" data-token="${tok}">Resend</button>`;
+    return `<div class="assignment-row ${status}" data-token="${tok}">
       <div class="assignment-name">${a.recipientName || '—'}<span class="email">${a.recipientEmail || ''}</span></div>
       <div class="assignment-tests">${tests}</div>
       <div class="assignment-status status-${status}">${statusLabel}</div>
       <div class="assignment-date">${completedDt ? 'Done ' + completedDt : 'Sent ' + dt}</div>
       <div class="assignment-actions">
-        ${status === 'completed' ? '<button class="assignment-action-btn primary" data-action="review" data-token="' + a.token + '">Review</button>' : '<button class="assignment-action-btn" data-action="resend" data-token="' + a.token + '">Resend</button>'}
-        <button class="assignment-action-btn" data-action="copy" data-token="' + a.token + '">Copy Link</button>
-        <button class="assignment-action-btn assignment-action-delete" data-action="delete" data-token="' + a.token + '" title="Delete this assignment">Delete</button>
+        ${primaryActionBtn}
+        <button class="assignment-action-btn" data-action="copy" data-token="${tok}">Copy Link</button>
+        <button class="assignment-action-btn assignment-action-delete" data-action="delete" data-token="${tok}" title="Delete this assignment">Delete</button>
       </div>
     </div>`;
   }).join('');
@@ -8973,8 +9012,11 @@ function renderAssignments() {
       e.stopPropagation();
       const action = btn.dataset.action;
       const token = btn.dataset.token;
-      const a = allAssignments.find(x => x.token === token);
-      if (!a) return;
+      const a = allAssignments.find(x => (x._fbKey || x.token) === token);
+      if (!a) {
+        console.warn('Assignment not found for token:', token);
+        return;
+      }
       if (action === 'copy') {
         copyAssignmentLink(a);
       } else if (action === 'resend') {
@@ -9109,20 +9151,31 @@ Leif`
 function reviewAssignment(assignment) {
   // Find the matching response or candidate record
   const isCandidate = assignment.tests && assignment.tests.includes('Candidate');
-  // Mark all notifications for this assignment as read, then recount from
-  // Firebase ground truth (the previous decrement-by-one assumed one notif
-  // per assignment which is not always true).
+  // Mark notifications for this assignment as read. Match permissively by
+  // token, Firebase key, OR recipientEmail so stale notifications from
+  // earlier versions of the schema also get cleared.
   if (firebaseReady && db) {
+    const fbKey = assignment._fbKey || assignment.token;
+    const recipientEmail = assignment.recipientEmail;
     db.ref('notifications').once('value').then(async snap => {
       const data = snap.val() || {};
       const updates = {};
       Object.entries(data).forEach(([id, n]) => {
-        if (n.assignmentToken === assignment.token && !n.read) {
+        if (n.read) return;  // skip already-read
+        const tokenMatch = n.assignmentToken && (n.assignmentToken === assignment.token || n.assignmentToken === fbKey);
+        const keyMatch = id === fbKey;
+        const emailMatch = recipientEmail && n.recipientEmail === recipientEmail;
+        if (tokenMatch || keyMatch || emailMatch) {
           updates['notifications/' + id + '/read'] = true;
         }
       });
       if (Object.keys(updates).length > 0) {
-        try { await db.ref().update(updates); } catch (e) { console.warn('Mark read failed', e); }
+        try {
+          await db.ref().update(updates);
+          console.log('Marked', Object.keys(updates).length, 'notifications as read');
+        } catch (e) {
+          console.error('Mark read failed', e);
+        }
       }
       // Recount from authoritative state
       try {
